@@ -29,10 +29,46 @@
   {
     "id": "CVE-2019-0211",
     "software": "nginx",
-    "affected_versions": ["nginx/1.18.0"],
+    "affected_versions": ["nginx/1.18.0", "nginx/1.20"],
     "cvss": 7.8,
     "severity": "HIGH",
     "summary": "Privilege escalation in web server worker processes.",
     "recommended_action": "Update to the latest stable web server release."
+  },
+  {
+    "id": "CVE-2020-1938",
+    "software": "Apache Tomcat",
+    "affected_versions": ["9.0"],
+    "cvss": 9.8,
+    "severity": "CRITICAL",
+    "summary": "Ghostcat: AJP request injection / file read & include in Apache Tomcat.",
+    "recommended_action": "Upgrade Tomcat and disable the AJP connector if unused."
+  },
+  {
+    "id": "CVE-2022-21449",
+    "software": "Apache Tomcat",
+    "affected_versions": ["9.0"],
+    "cvss": 7.5,
+    "severity": "HIGH",
+    "summary": "Improper signature verification allowing authentication bypass.",
+    "recommended_action": "Apply the latest Tomcat security patches."
+  },
+  {
+    "id": "CVE-2016-6662",
+    "software": "MySQL",
+    "affected_versions": ["5.7"],
+    "cvss": 9.8,
+    "severity": "CRITICAL",
+    "summary": "Remote code execution / privilege escalation via malicious config.",
+    "recommended_action": "Patch MySQL and restrict FILE privileges."
+  },
+  {
+    "id": "CVE-2019-10164",
+    "software": "PostgreSQL",
+    "affected_versions": ["11"],
+    "cvss": 8.8,
+    "severity": "HIGH",
+    "summary": "Stack buffer overflow in PostgreSQL via crafted SCRAM messages.",
+    "recommended_action": "Upgrade PostgreSQL to a patched minor release."
   }
 ]

@@ -25,7 +25,7 @@ NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
 
 def sev_rank(s):
-    return {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(s, 3)
+    return {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}.get(s, 4)
 
 
 # ----------------------------------------------------------------- live NVD pull
