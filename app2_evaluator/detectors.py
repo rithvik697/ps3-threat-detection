@@ -13,6 +13,7 @@ SQL_INJECTION, PORT_SCAN, BLOCKED_CONNECTION, ...). So detection has two parts:
 Each detector returns plain 'finding' dicts; turning findings into
 SecurityIncident objects (and CVE correlation) happens in incidents.py.
 """
+import math
 from collections import defaultdict, Counter
 
 import config
@@ -84,6 +85,36 @@ def _campaign_findings(logs, event_type, label, per_ip_threshold, base_sev,
     return findings
 
 
+def _source_profiles(logs):
+    """Aggregate source-IP behavior once so statistical and ML detectors agree."""
+    prof = defaultdict(lambda: {"events": 0, "failures": 0, "ports": set(),
+                                "hosts": defaultdict(int), "port_counts": defaultdict(int),
+                                "http_errors": 0, "login_failed": 0, "sql_injection": 0,
+                                "port_scan": 0, "blocked": 0})
+    for l in logs:
+        p = prof[l.get("source_ip", "-")]
+        event_type = l.get("event_type")
+        p["events"] += 1
+        if event_type in config.FAILURE_EVENT_TYPES or is_http_error(l.get("status_code")):
+            p["failures"] += 1
+        if is_http_error(l.get("status_code")):
+            p["http_errors"] += 1
+        if event_type == config.ET_LOGIN_FAILED:
+            p["login_failed"] += 1
+        elif event_type == config.ET_SQL_INJECTION:
+            p["sql_injection"] += 1
+        elif event_type == config.ET_PORT_SCAN:
+            p["port_scan"] += 1
+        elif event_type == config.ET_BLOCKED_CONNECTION:
+            p["blocked"] += 1
+        dp = l.get("destination_port")
+        if dp is not None:
+            p["ports"].add(dp)
+            p["port_counts"][dp] += 1
+        p["hosts"][l.get("host", "-")] += 1
+    return prof
+
+
 # ----------------------------------------------------------------- signatures
 def detect_brute_force(logs):
     """Many failed logins from one IP against one host (optionally followed by
@@ -143,18 +174,7 @@ def detect_statistical_anomalies(logs, z_threshold=config.ANOMALY_Z_THRESHOLD,
     IPs (each with a single event) makes any tiny value look like a huge
     outlier. No training, no labels, fully explainable.
     """
-    prof = defaultdict(lambda: {"events": 0, "failures": 0, "ports": set(),
-                                "hosts": defaultdict(int), "port_counts": defaultdict(int)})
-    for l in logs:
-        p = prof[l.get("source_ip", "-")]
-        p["events"] += 1
-        if l.get("event_type") in config.FAILURE_EVENT_TYPES or is_http_error(l.get("status_code")):
-            p["failures"] += 1
-        dp = l.get("destination_port")
-        if dp is not None:
-            p["ports"].add(dp)
-            p["port_counts"][dp] += 1
-        p["hosts"][l.get("host", "-")] += 1
+    prof = _source_profiles(logs)
 
     # Only profile IPs with enough activity to have a meaningful behaviour.
     ips = [ip for ip in prof if prof[ip]["events"] >= min_events]
@@ -193,6 +213,100 @@ def detect_statistical_anomalies(logs, z_threshold=config.ANOMALY_Z_THRESHOLD,
     return findings
 
 
+# ----------------------------------------------------------------- optional ML
+def _ml_features(profile):
+    events = profile["events"] or 1
+    return [
+        math.log1p(profile["events"]),
+        math.log1p(profile["failures"]),
+        profile["failures"] / events,
+        math.log1p(len(profile["ports"])),
+        math.log1p(len(profile["hosts"])),
+        math.log1p(profile["http_errors"]),
+        math.log1p(profile["login_failed"]),
+        math.log1p(profile["sql_injection"]),
+        math.log1p(profile["port_scan"]),
+        math.log1p(profile["blocked"]),
+    ]
+
+
+def _has_ml_security_signal(profile):
+    events = profile["events"] or 1
+    failure_ratio = profile["failures"] / events
+    if profile["failures"] >= config.ML_ANOMALY_MIN_FAILURES:
+        return True
+    if failure_ratio >= config.ML_ANOMALY_MIN_FAILURE_RATIO:
+        return True
+    if len(profile["ports"]) >= config.ML_ANOMALY_MIN_DISTINCT_PORTS:
+        return True
+    return False
+
+
+def detect_ml_anomalies(logs):
+    """unsupervised ML detector using sklearn IsolationForest.
+
+    This is deliberately dependency-safe: if scikit-learn is not installed,
+    the evaluator still runs and simply skips this extra layer.
+    """
+    if not config.ML_ANOMALY_ENABLED:
+        return []
+    try:
+        from sklearn.ensemble import IsolationForest
+    except Exception:
+        return []
+
+    prof = _source_profiles(logs)
+    ips = [ip for ip in prof if prof[ip]["events"] >= config.ANOMALY_MIN_EVENTS]
+    if len(ips) < config.ML_ANOMALY_MIN_IPS:
+        return []
+
+    rows = [_ml_features(prof[ip]) for ip in ips]
+    model = IsolationForest(
+        contamination=config.ML_ANOMALY_CONTAMINATION,
+        random_state=config.ML_ANOMALY_RANDOM_STATE,
+    )
+    predictions = model.fit_predict(rows)
+    scores = model.decision_function(rows)  # lower means more anomalous
+
+    anomalous = [(ip, score) for ip, pred, score in zip(ips, predictions, scores)
+                 if pred == -1 and _has_ml_security_signal(prof[ip])]
+    anomalous.sort(key=lambda item: item[1])
+
+    findings = []
+    total = max(1, len(anomalous))
+    for rank, (ip, score) in enumerate(anomalous, start=1):
+        p = prof[ip]
+        host = max(p["hosts"], key=p["hosts"].get)
+        pc = p["port_counts"]
+        port = max(pc, key=pc.get) if pc else 0
+        failure_ratio = p["failures"] / (p["events"] or 1)
+        confidence = round(min(0.99, 0.65 + (total - rank + 1) / total * 0.25), 2)
+        severity = "HIGH" if (
+            p["failures"] >= config.FAILED_LOGIN_THRESHOLD
+            or p["sql_injection"] >= config.SQLI_THRESHOLD
+            or p["port_scan"] >= config.PORT_SCAN_THRESHOLD
+        ) else "MEDIUM"
+        findings.append({
+            "attack_type": "ML Behavioral Anomaly",
+            "target_host": host, "target_port": port, "source_ips": [ip],
+            "count": p["events"], "breached": severity == "HIGH",
+            "severity": severity,
+            "confidence": confidence,
+            "reason": (
+                "IsolationForest flagged source behavior as anomalous "
+                f"(score {score:.3f}); events={p['events']}, "
+                f"failures={p['failures']}, failure_ratio={failure_ratio:.2f}, "
+                f"distinct_ports={len(p['ports'])}, distinct_hosts={len(p['hosts'])}; "
+                "passed security-signal gate"
+            ),
+            "extra": {"model": "sklearn IsolationForest",
+                      "features": ["events", "failures", "failure_ratio",
+                                   "distinct_ports", "distinct_hosts", "http_errors",
+                                   "login_failed", "sql_injection", "port_scan", "blocked"]},
+        })
+    return findings
+
+
 # ----------------------------------------------------------------- phase 1 entry
 SIGNATURE_DETECTORS = (detect_brute_force, detect_sql_injection,
                        detect_port_scan, detect_failed_logins)
@@ -211,5 +325,8 @@ def detect_all(logs):
             findings.append(f)
     for f in detect_statistical_anomalies(logs):
         f.setdefault("method", "behavioral")      # the generalizer -> catches the unknown
+        findings.append(f)
+    for f in detect_ml_anomalies(logs):
+        f.setdefault("method", "ml")              # optional sklearn IsolationForest layer
         findings.append(f)
     return findings

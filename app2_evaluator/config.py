@@ -15,6 +15,13 @@ PORT_SCAN_THRESHOLD = 5       # PORT_SCAN events from one IP -> active scanner
 DISTRIBUTED_THRESHOLD = 50    # total events of a labelled attack -> aggregate incident
 ANOMALY_MIN_EVENTS = 5        # only profile IPs with >= this many events (kills one-off flood)
 ANOMALY_Z_THRESHOLD = 3.5     # modified z-score (median/MAD) cutoff for an outlier
+ML_ANOMALY_ENABLED = True     # run optional IsolationForest layer when sklearn is installed
+ML_ANOMALY_MIN_IPS = 20       # need enough active IPs for a meaningful unsupervised model
+ML_ANOMALY_CONTAMINATION = 0.03  # expected anomalous fraction among profiled IPs
+ML_ANOMALY_RANDOM_STATE = 42
+ML_ANOMALY_MIN_FAILURES = 1   # suppress busy-but-clean IPs unless they look scan-like
+ML_ANOMALY_MIN_FAILURE_RATIO = 0.05
+ML_ANOMALY_MIN_DISTINCT_PORTS = 10
 
 # --- INPUT SCHEMA VOCABULARY ------------------------------------------------
 # The exact string values the generator emits (verified against App 1's output).

@@ -27,7 +27,8 @@ from models import SecurityIncident
 from stats import median, robust_z, is_http_error
 from detectors import (detect_brute_force, detect_sql_injection,
                        detect_port_scan, detect_failed_logins,
-                       detect_statistical_anomalies, detect_all)
+                       detect_statistical_anomalies, detect_ml_anomalies,
+                       detect_all)
 from correlation import (sev_rank, correlate, fetch_cves_live,
                          resolve_cves, refresh_cache)
 from incidents import build_incident, correlate_findings, prioritise, evaluate
@@ -39,7 +40,8 @@ DEFAULT_CVE = config.DEFAULT_CVE
 __all__ = [
     "SecurityIncident", "median", "robust_z", "is_http_error",
     "detect_brute_force", "detect_sql_injection", "detect_port_scan",
-    "detect_failed_logins", "detect_statistical_anomalies", "detect_all",
+    "detect_failed_logins", "detect_statistical_anomalies",
+    "detect_ml_anomalies", "detect_all",
     "sev_rank", "correlate", "fetch_cves_live", "resolve_cves",
     "refresh_cache", "build_incident", "correlate_findings", "prioritise",
     "evaluate", "load",
