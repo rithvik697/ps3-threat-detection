@@ -20,6 +20,7 @@ def build_incident(finding, cves, use_live=False):
         "event_count": finding.get("count"),
         "reason": finding.get("reason") or finding["attack_type"],
     }
+    evidence.update(finding.get("extra", {}))     # detector-specific detail
     if software:
         evidence["affected_software"] = software
     if matched:
@@ -53,9 +54,9 @@ def correlate_findings(findings, cves, use_live=False):
 
 def prioritise(incidents):
     """PHASE 3 — order by severity, then by confidence within a severity."""
-    order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     return sorted(incidents,
-                  key=lambda i: (order.get(i.evidence.get("severity"), 3), -i.confidence))
+                  key=lambda i: (order.get(i.evidence.get("severity"), 4), -i.confidence))
 
 
 def evaluate(logs, cves, use_live=False):

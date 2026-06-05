@@ -1,24 +1,93 @@
 """
 Detection layer  (owner: E1).
 
-Two kinds of detector:
-  * signature rules  -> known attack shapes, precise labels
-  * the generalizer  -> signature-free statistical anomaly detection
+The generator pre-labels every event with an `event_type` (LOGIN_FAILED,
+SQL_INJECTION, PORT_SCAN, BLOCKED_CONNECTION, ...). So detection has two parts:
 
-Each detector returns plain 'finding' dicts. Turning findings into
-SecurityIncident objects (and CVE correlation) happens in incidents.py, so
-detection stays independent of output formatting.
+  * signature/campaign rules -> recognise labelled malicious events and
+        AGGREGATE them per attacker (one incident per campaign, not per event,
+        so 3000 SQLi events become ONE clean incident).
+  * the generalizer          -> signature-free statistical anomaly detection,
+        for behaviour we never wrote a rule for.
+
+Each detector returns plain 'finding' dicts; turning findings into
+SecurityIncident objects (and CVE correlation) happens in incidents.py.
 """
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import config
 from stats import robust_z, is_http_error
 
 
+# ----------------------------------------------------------------- helpers
+def _finding_from_events(label, ips, evs, base_sev, concentrated, service_port=None):
+    """Build one finding that summarises a group of malicious events.
+
+    service_port lets a detector pin CVE correlation to the service the attack
+    actually targets (e.g. credential attacks -> SSH/22), or disable it with 0
+    (e.g. a port scan is reconnaissance, not exploitation of one CVE)."""
+    hosts = Counter(e.get("host") for e in evs)
+    ports = Counter(e.get("destination_port") for e in evs if e.get("destination_port"))
+    if service_port is not None:
+        port = service_port
+    else:
+        # prefer the most common port that maps to a known service, so CVE
+        # correlation lands on something meaningful rather than an arbitrary port.
+        mapped = [p for p, _ in ports.most_common() if p in config.PORT_SOFTWARE]
+        port = mapped[0] if mapped else (ports.most_common(1)[0][0] if ports else 0)
+    n = len(evs)
+    sev = "CRITICAL" if (concentrated and n >= 50 and base_sev == "HIGH") else base_sev
+    sample = next((e.get("payload") for e in evs if e.get("payload")), None)
+    reason = (f'{n} {label} event(s) from {len(ips)} source IP(s) '
+              f'targeting {len(hosts)} host(s)'
+              + (f'; sample payload: {sample!r}' if sample else ''))
+    return {
+        "attack_type": label + ("" if concentrated else " (distributed)"),
+        "target_host": hosts.most_common(1)[0][0] if hosts else "-",
+        "target_port": port,
+        "source_ips": ips[:10],
+        "count": n,
+        "breached": concentrated,
+        "severity": sev,
+        "confidence": round(min(0.99, 0.7 + n / 5000), 2),
+        "reason": reason,
+        "extra": {"source_ip_count": len(ips),
+                  "targeted_ports": sorted(p for p in ports)[:15]},
+    }
+
+
+def _campaign_findings(logs, event_type, label, per_ip_threshold, base_sev,
+                       service_port=None):
+    """Aggregate labelled malicious events into incidents.
+
+    A single IP exceeding `per_ip_threshold` events -> a focused per-attacker
+    incident. The scattered remainder, if large, -> one aggregate 'distributed'
+    incident (so thousands of one-off events don't become thousands of alerts).
+    """
+    by_ip = defaultdict(list)
+    for l in logs:
+        if l.get("event_type") == event_type:
+            by_ip[l.get("source_ip")].append(l)
+
+    findings, concentrated = [], set()
+    for ip, evs in by_ip.items():
+        if len(evs) >= per_ip_threshold:
+            concentrated.add(ip)
+            findings.append(_finding_from_events(label, [ip], evs, base_sev, True, service_port))
+
+    rest = [(ip, evs) for ip, evs in by_ip.items() if ip not in concentrated]
+    rest_n = sum(len(e) for _, e in rest)
+    if rest_n >= config.DISTRIBUTED_THRESHOLD:
+        ips = [ip for ip, _ in rest]
+        all_evs = [e for _, evs in rest for e in evs]
+        findings.append(_finding_from_events(label, ips, all_evs, base_sev, False, service_port))
+    return findings
+
+
 # ----------------------------------------------------------------- signatures
 def detect_brute_force(logs):
     """Many failed logins from one IP against one host (optionally followed by
-    a success = a confirmed breach)."""
+    a success = a confirmed breach). Fires on CONCENTRATED brute force."""
     fails = defaultdict(list)
     successes = set()
     for l in logs:
@@ -42,39 +111,37 @@ def detect_brute_force(logs):
     return findings
 
 
-def detect_port_scan(logs, min_ports=config.PORT_SCAN_THRESHOLD):
-    """One IP touching many distinct destination ports = reconnaissance."""
-    ports_by_ip = defaultdict(set)
-    hosts_by_ip = defaultdict(lambda: defaultdict(int))
-    for l in logs:
-        if l.get("source_type") == config.ST_FIREWALL or l.get("event_type") == config.ET_CONN_BLOCKED:
-            dp = l.get("destination_port")
-            if dp is not None:
-                ip = l.get("source_ip")
-                ports_by_ip[ip].add(dp)
-                hosts_by_ip[ip][l.get("host", "-")] += 1
-    findings = []
-    for ip, ports in ports_by_ip.items():
-        if len(ports) >= min_ports:
-            host = max(hosts_by_ip[ip], key=hosts_by_ip[ip].get)
-            findings.append({
-                "attack_type": "Port Scan",
-                "target_host": host, "target_port": 0, "source_ips": [ip],
-                "count": len(ports), "breached": False, "confidence": 0.8,
-                "reason": f'{ip} probed {len(ports)} distinct ports: {sorted(ports)}',
-            })
-    return findings
+def detect_sql_injection(logs):
+    """SQL-injection attempts (labelled SQL_INJECTION), aggregated per attacker."""
+    return _campaign_findings(logs, config.ET_SQL_INJECTION, "SQL Injection",
+                              config.SQLI_THRESHOLD, "HIGH")
+
+
+def detect_port_scan(logs):
+    """Port-scan activity (labelled PORT_SCAN), aggregated per scanner.
+    Reconnaissance is not exploitation of one CVE -> service_port=0 (no CVE);
+    the scanned ports are listed in the incident evidence instead."""
+    return _campaign_findings(logs, config.ET_PORT_SCAN, "Port Scan",
+                              config.PORT_SCAN_THRESHOLD, "MEDIUM", service_port=0)
+
+
+def detect_failed_logins(logs):
+    """Failed-login surge (labelled LOGIN_FAILED) beyond concentrated brute force.
+    Credential attacks target the auth service -> correlate to SSH (port 22)."""
+    return _campaign_findings(logs, config.ET_LOGIN_FAILED, "Failed Login",
+                              config.FAILED_LOGIN_THRESHOLD, "MEDIUM", service_port=22)
 
 
 # ----------------------------------------------------------------- generalizer
-def detect_statistical_anomalies(logs, z_threshold=config.ANOMALY_Z_THRESHOLD):
+def detect_statistical_anomalies(logs, z_threshold=config.ANOMALY_Z_THRESHOLD,
+                                 min_events=config.ANOMALY_MIN_EVENTS):
     """Signature-FREE detection: the generalizer.
 
-    Instead of looking for KNOWN attack shapes, profile how every source IP
-    behaves, build a population baseline of 'normal', and flag any IP that
-    deviates sharply. Catches novel attacks we never wrote a rule for (e.g.
-    password spraying that stays under the per-host brute-force threshold).
-    No training, no labels, fully explainable.
+    Profiles how each ACTIVE source IP behaves, builds a population baseline of
+    'normal', and flags any IP that deviates sharply. Only IPs with >=
+    `min_events` events are profiled — without that floor, the flood of one-off
+    IPs (each with a single event) makes any tiny value look like a huge
+    outlier. No training, no labels, fully explainable.
     """
     prof = defaultdict(lambda: {"events": 0, "failures": 0, "ports": set(),
                                 "hosts": defaultdict(int), "port_counts": defaultdict(int)})
@@ -89,11 +156,11 @@ def detect_statistical_anomalies(logs, z_threshold=config.ANOMALY_Z_THRESHOLD):
             p["port_counts"][dp] += 1
         p["hosts"][l.get("host", "-")] += 1
 
-    ips = list(prof)
+    # Only profile IPs with enough activity to have a meaningful behaviour.
+    ips = [ip for ip in prof if prof[ip]["events"] >= min_events]
     if len(ips) < 3:               # too few entities for a meaningful baseline
         return []
 
-    # Three intuitive, independently-explainable behavioural features per IP.
     feats = {
         "failures":       {ip: prof[ip]["failures"]   for ip in ips},
         "events":         {ip: prof[ip]["events"]     for ip in ips},
@@ -127,6 +194,10 @@ def detect_statistical_anomalies(logs, z_threshold=config.ANOMALY_Z_THRESHOLD):
 
 
 # ----------------------------------------------------------------- phase 1 entry
+SIGNATURE_DETECTORS = (detect_brute_force, detect_sql_injection,
+                       detect_port_scan, detect_failed_logins)
+
+
 def detect_all(logs):
     """PHASE 1 — DETECTION (no CVE knowledge here).
 
@@ -134,10 +205,11 @@ def detect_all(logs):
     method that produced it. Correlation happens afterwards as a separate phase.
     """
     findings = []
-    for f in detect_brute_force(logs) + detect_port_scan(logs):
-        f.setdefault("method", "signature")   # known attack shapes -> precise label
-        findings.append(f)
+    for detector in SIGNATURE_DETECTORS:
+        for f in detector(logs):
+            f.setdefault("method", "signature")   # labelled attack -> precise incident
+            findings.append(f)
     for f in detect_statistical_anomalies(logs):
-        f.setdefault("method", "behavioral")  # the generalizer -> catches the unknown
+        f.setdefault("method", "behavioral")      # the generalizer -> catches the unknown
         findings.append(f)
     return findings

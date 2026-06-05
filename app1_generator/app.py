@@ -2,7 +2,14 @@ import streamlit as st
 import pandas as pd
 import json
 import subprocess
-import os
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+GENERATOR = SCRIPT_DIR / "generator.py"
+LOGS_JSON = SCRIPT_DIR / "logs.json"
+LOGS_CSV = SCRIPT_DIR / "logs.csv"
+LOGS_SYSLOG = SCRIPT_DIR / "logs.syslog"
 
 # -----------------------------
 # PAGE CONFIG
@@ -26,11 +33,29 @@ st.markdown(
 # GENERATE BUTTON
 # -----------------------------
 
-if st.button("🔄 Generate 50,000 Logs"):
+log_count = st.number_input(
+    "Number of logs",
+    min_value=100,
+    max_value=200000,
+    value=50000,
+    step=1000,
+)
 
-    subprocess.run(["python", "generator.py"])
+if st.button(f"🔄 Generate {log_count:,} Logs"):
 
-    st.success("50,000 Logs Generated Successfully!")
+    result = subprocess.run(
+        [sys.executable, str(GENERATOR), "--lines", str(int(log_count)), "--out", str(LOGS_JSON)],
+        cwd=SCRIPT_DIR,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        st.error("Log generation failed.")
+        st.code(result.stderr or result.stdout)
+        st.stop()
+
+    st.success(f"{int(log_count):,} Logs Generated Successfully!")
 
     st.rerun()
 
@@ -38,9 +63,9 @@ if st.button("🔄 Generate 50,000 Logs"):
 # LOAD LOGS
 # -----------------------------
 
-if os.path.exists("logs.json"):
+if LOGS_JSON.exists():
 
-    with open("logs.json", "r") as file:
+    with open(LOGS_JSON, "r") as file:
         logs = json.load(file)
 
     df_logs = pd.DataFrame(logs)
@@ -146,7 +171,7 @@ st.subheader("📥 Export Logs")
 col1, col2, col3 = st.columns(3)
 
 # JSON Download
-with open("logs.json", "rb") as f:
+with open(LOGS_JSON, "rb") as f:
 
     col1.download_button(
         "📄 Download JSON",
@@ -156,9 +181,9 @@ with open("logs.json", "rb") as f:
     )
 
 # CSV Download
-if os.path.exists("logs.csv"):
+if LOGS_CSV.exists():
 
-    with open("logs.csv", "rb") as f:
+    with open(LOGS_CSV, "rb") as f:
 
         col2.download_button(
             "📊 Download CSV",
@@ -168,9 +193,9 @@ if os.path.exists("logs.csv"):
         )
 
 # SYSLOG Download
-if os.path.exists("logs.syslog"):
+if LOGS_SYSLOG.exists():
 
-    with open("logs.syslog", "rb") as f:
+    with open(LOGS_SYSLOG, "rb") as f:
 
         col3.download_button(
             "📡 Download Syslog",

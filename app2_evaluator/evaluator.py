@@ -25,7 +25,8 @@ from dataclasses import asdict
 import config
 from models import SecurityIncident
 from stats import median, robust_z, is_http_error
-from detectors import (detect_brute_force, detect_port_scan,
+from detectors import (detect_brute_force, detect_sql_injection,
+                       detect_port_scan, detect_failed_logins,
                        detect_statistical_anomalies, detect_all)
 from correlation import (sev_rank, correlate, fetch_cves_live,
                          resolve_cves, refresh_cache)
@@ -37,8 +38,9 @@ DEFAULT_CVE = config.DEFAULT_CVE
 
 __all__ = [
     "SecurityIncident", "median", "robust_z", "is_http_error",
-    "detect_brute_force", "detect_port_scan", "detect_statistical_anomalies",
-    "detect_all", "sev_rank", "correlate", "fetch_cves_live", "resolve_cves",
+    "detect_brute_force", "detect_sql_injection", "detect_port_scan",
+    "detect_failed_logins", "detect_statistical_anomalies", "detect_all",
+    "sev_rank", "correlate", "fetch_cves_live", "resolve_cves",
     "refresh_cache", "build_incident", "correlate_findings", "prioritise",
     "evaluate", "load",
 ]

@@ -1,0 +1,100 @@
+[
+  {
+    "host": "web-01",
+    "criticality": "HIGH",
+    "services": [
+      {
+        "name": "OpenSSH",
+        "version": "8.4",
+        "port": 22
+      },
+      {
+        "name": "Nginx",
+        "version": "1.20",
+        "port": 443
+      }
+    ]
+  },
+  {
+    "host": "web-02",
+    "criticality": "HIGH",
+    "services": [
+      {
+        "name": "OpenSSH",
+        "version": "8.4",
+        "port": 22
+      },
+      {
+        "name": "Nginx",
+        "version": "1.20",
+        "port": 443
+      }
+    ]
+  },
+  {
+    "host": "auth-01",
+    "criticality": "CRITICAL",
+    "services": [
+      {
+        "name": "OpenSSH",
+        "version": "7.2",
+        "port": 22
+      }
+    ]
+  },
+  {
+    "host": "auth-02",
+    "criticality": "CRITICAL",
+    "services": [
+      {
+        "name": "OpenSSH",
+        "version": "7.2",
+        "port": 22
+      }
+    ]
+  },
+  {
+    "host": "app-01",
+    "criticality": "HIGH",
+    "services": [
+      {
+        "name": "Tomcat",
+        "version": "9.0",
+        "port": 8080
+      }
+    ]
+  },
+  {
+    "host": "app-02",
+    "criticality": "HIGH",
+    "services": [
+      {
+        "name": "Tomcat",
+        "version": "9.0",
+        "port": 8080
+      }
+    ]
+  },
+  {
+    "host": "fw-01",
+    "criticality": "CRITICAL",
+    "services": [
+      {
+        "name": "FirewallD",
+        "version": "1.0",
+        "port": 0
+      }
+    ]
+  },
+  {
+    "host": "net-01",
+    "criticality": "MEDIUM",
+    "services": [
+      {
+        "name": "NetworkMonitor",
+        "version": "2.1",
+        "port": 161
+      }
+    ]
+  }
+]
