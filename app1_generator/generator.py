@@ -8,8 +8,13 @@ is in App 2's CVE cache -> guarantees a clean correlation in the demo.
 
 Run:  python generator.py --lines 50000 --attacks brute_force --out ../data/logs.json
 """
-import json, csv, random, argparse
+import json, csv, random, argparse, os
 from datetime import datetime, timedelta
+
+# Anchor the default output to <project_root>/data so the script works no matter
+# which directory you run it from.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_OUT = os.path.join(PROJECT_ROOT, "data", "logs.json")
 
 NORMAL_IPS = [f"10.0.0.{i}" for i in range(2, 60)]
 ATTACKER_IP = "185.220.101.47"        # single hostile IP for the brute-force burst
@@ -68,6 +73,7 @@ def generate(lines, attacks):
     return logs
 
 def export(logs, path):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     if path.endswith(".json"):
         json.dump(logs, open(path, "w"), indent=2)
     elif path.endswith(".csv"):
@@ -83,7 +89,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--lines", type=int, default=5000)
     ap.add_argument("--attacks", default="brute_force,port_scan")
-    ap.add_argument("--out", default="../data/logs.json")
+    ap.add_argument("--out", default=DEFAULT_OUT)
     a = ap.parse_args()
     logs = generate(a.lines, a.attacks.split(","))
     export(logs, a.out)

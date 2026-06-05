@@ -5,10 +5,15 @@ correlates affected software/version with cached CVEs, emits prioritized alerts.
 
 Run:  python evaluator.py --logs ../data/logs.json --cve ../data/cve_cache.json
 """
-import json, argparse
+import json, argparse, os
 from collections import defaultdict
 
 FAILED_LOGIN_THRESHOLD = 50   # failures from one IP -> brute-force suspicion
+
+# Anchor defaults to <project_root>/data so the script works from any directory.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_LOGS = os.path.join(PROJECT_ROOT, "data", "logs.json")
+DEFAULT_CVE = os.path.join(PROJECT_ROOT, "data", "cve_cache.json")
 
 def load(path):
     return json.load(open(path))
@@ -77,8 +82,8 @@ def evaluate(logs, cves):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--logs", default="../data/logs.json")
-    ap.add_argument("--cve", default="../data/cve_cache.json")
+    ap.add_argument("--logs", default=DEFAULT_LOGS)
+    ap.add_argument("--cve", default=DEFAULT_CVE)
     a = ap.parse_args()
     alerts = evaluate(load(a.logs), load(a.cve))
     print(f"\n=== {len(alerts)} ALERT(S) ===\n")
