@@ -1,97 +1,98 @@
-"""
-APP 1 - LOG GENERATOR
-Produces realistic multi-source logs with configurable normal vs attack mix.
-Exports JSON / CSV / syslog.
+# --------------------------------
+# ASSET INVENTORY GENERATION
+# --------------------------------
 
-KEY TRICK: the attack burst uses a software version (OpenSSH 7.2p2) that we KNOW
-is in App 2's CVE cache -> guarantees a clean correlation in the demo.
+assets = []
 
-Run:  python generator.py --lines 50000 --attacks brute_force --out ../data/logs.json
-"""
-import json, csv, random, argparse, os
-from datetime import datetime, timedelta
+all_hosts = []
 
-# Anchor the default output to <project_root>/data so the script works no matter
-# which directory you run it from.
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_OUT = os.path.join(PROJECT_ROOT, "data", "logs.json")
+for host_list in HOSTS.values():
+    all_hosts.extend(host_list)
 
-NORMAL_IPS = [f"10.0.0.{i}" for i in range(2, 60)]
-ATTACKER_IP = "185.220.101.47"        # single hostile IP for the brute-force burst
-HOSTS = ["web-01", "web-02", "db-01", "auth-01"]
-SERVICES = ["sshd", "nginx", "postgres", "firewall"]
-VULN_VERSION = "OpenSSH_7.2p2"        # <-- matches CVE cache in App 2
+for host in all_hosts:
 
-def ts(base, secs):
-    return (base + timedelta(seconds=secs)).isoformat()
+    if host.startswith("web"):
 
-def normal_entry(base, sec):
-    return {
-        "timestamp": ts(base, sec),
-        "source_ip": random.choice(NORMAL_IPS),
-        "host": random.choice(HOSTS),
-        "service": random.choice(SERVICES),
-        "version": VULN_VERSION if random.random() < 0.3 else "nginx/1.18.0",
-        "event": "connection",
-        "status": "success",
-    }
-
-def brute_force_burst(base, start_sec, n=200):
-    """n failed SSH logins from one IP, then ONE success = classic brute-force."""
-    out = []
-    for i in range(n):
-        out.append({
-            "timestamp": ts(base, start_sec + i),
-            "source_ip": ATTACKER_IP, "host": "web-01", "service": "sshd",
-            "version": VULN_VERSION, "event": "auth", "status": "failed",
+        assets.append({
+            "host": host,
+            "criticality": "HIGH",
+            "services": [
+                {
+                    "name": "OpenSSH",
+                    "version": "8.4",
+                    "port": 22
+                },
+                {
+                    "name": "Nginx",
+                    "version": "1.20",
+                    "port": 443
+                }
+            ]
         })
-    out.append({
-        "timestamp": ts(base, start_sec + n),
-        "source_ip": ATTACKER_IP, "host": "web-01", "service": "sshd",
-        "version": VULN_VERSION, "event": "auth", "status": "success",
-    })
-    return out
 
-def port_scan_burst(base, start_sec):
-    out = []
-    for p in [21, 22, 23, 25, 80, 443, 3306, 5432, 8080]:
-        out.append({
-            "timestamp": ts(base, start_sec), "source_ip": ATTACKER_IP,
-            "host": "firewall", "service": "firewall", "version": "-",
-            "event": f"port_probe:{p}", "status": "blocked",
+    elif host.startswith("auth"):
+
+        assets.append({
+            "host": host,
+            "criticality": "CRITICAL",
+            "services": [
+                {
+                    "name": "OpenSSH",
+                    "version": "7.2",
+                    "port": 22
+                }
+            ]
         })
-    return out
 
-def generate(lines, attacks):
-    base = datetime(2026, 6, 5, 9, 0, 0)
-    logs = [normal_entry(base, s) for s in range(lines)]
-    if "brute_force" in attacks:
-        logs += brute_force_burst(base, start_sec=lines // 2)
-    if "port_scan" in attacks:
-        logs += port_scan_burst(base, start_sec=lines // 3)
-    logs.sort(key=lambda x: x["timestamp"])
-    return logs
+    elif host.startswith("app"):
 
-def export(logs, path):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    if path.endswith(".json"):
-        json.dump(logs, open(path, "w"), indent=2)
-    elif path.endswith(".csv"):
-        w = csv.DictWriter(open(path, "w", newline=""), fieldnames=logs[0].keys())
-        w.writeheader(); w.writerows(logs)
-    else:  # syslog-ish
-        with open(path, "w") as f:
-            for l in logs:
-                f.write(f'{l["timestamp"]} {l["host"]} {l["service"]}[{l["version"]}]: '
-                        f'{l["event"]} {l["status"]} from {l["source_ip"]}\n')
+        assets.append({
+            "host": host,
+            "criticality": "HIGH",
+            "services": [
+                {
+                    "name": "Tomcat",
+                    "version": "9.0",
+                    "port": 8080
+                }
+            ]
+        })
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--lines", type=int, default=5000)
-    ap.add_argument("--attacks", default="brute_force,port_scan")
-    ap.add_argument("--out", default=DEFAULT_OUT)
-    a = ap.parse_args()
-    logs = generate(a.lines, a.attacks.split(","))
-    export(logs, a.out)
-    print(f"Generated {len(logs)} log lines -> {a.out}")
-    print(f"Injected attacks: {a.attacks}")
+    elif host.startswith("fw"):
+
+        assets.append({
+            "host": host,
+            "criticality": "CRITICAL",
+            "services": [
+                {
+                    "name": "FirewallD",
+                    "version": "1.0",
+                    "port": 0
+                }
+            ]
+        })
+
+    elif host.startswith("net"):
+
+        assets.append({
+            "host": host,
+            "criticality": "MEDIUM",
+            "services": [
+                {
+                    "name": "NetworkMonitor",
+                    "version": "2.1",
+                    "port": 161
+                }
+            ]
+        })
+
+# Export assets
+
+with open("assets.json", "w") as f:
+    json.dump(
+        assets,
+        f,
+        indent=4
+    )
+
+print("assets.json generated successfully.")
