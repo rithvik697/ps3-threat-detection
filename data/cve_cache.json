@@ -1,0 +1,38 @@
+[
+  {
+    "id": "CVE-2016-6210",
+    "software": "OpenSSH",
+    "affected_versions": ["OpenSSH_7.2p2", "OpenSSH_7.2"],
+    "cvss": 5.9,
+    "severity": "MEDIUM",
+    "summary": "User enumeration via timing in OpenSSH before 7.3.",
+    "recommended_action": "Upgrade OpenSSH to 7.3 or later."
+  },
+  {
+    "id": "CVE-2018-15473",
+    "software": "OpenSSH",
+    "affected_versions": ["OpenSSH_7.2p2", "OpenSSH_7.2"],
+    "cvss": 5.3,
+    "severity": "MEDIUM",
+    "summary": "Username enumeration vulnerability in OpenSSH.",
+    "recommended_action": "Upgrade OpenSSH and rotate credentials."
+  },
+  {
+    "id": "CVE-2021-41617",
+    "software": "OpenSSH",
+    "affected_versions": ["OpenSSH_7.2p2"],
+    "cvss": 7.0,
+    "severity": "HIGH",
+    "summary": "Privilege escalation via supplemental groups in sshd.",
+    "recommended_action": "Patch sshd and restrict AuthorizedKeysCommand privileges."
+  },
+  {
+    "id": "CVE-2019-0211",
+    "software": "nginx",
+    "affected_versions": ["nginx/1.18.0"],
+    "cvss": 7.8,
+    "severity": "HIGH",
+    "summary": "Privilege escalation in web server worker processes.",
+    "recommended_action": "Update to the latest stable web server release."
+  }
+]
