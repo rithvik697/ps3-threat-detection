@@ -1,25 +1,60 @@
 """
 APP 2 - LOG EVALUATOR
-Reads logs from App 1, detects anomalies (brute-force, port scan),
-correlates affected software/version with cached CVEs, emits prioritized alerts.
+Reads security events (new schema), detects attacks with two layers
+(signature rules + a signature-free behavioral/statistical layer), correlates
+the targeted service to cached CVEs, and emits structured SecurityIncident
+objects.
 
 Run:  python evaluator.py --logs ../data/logs.json --cve ../data/cve_cache.json
+      python evaluator.py --json        # machine-readable output for the UI
 """
 import json, argparse, os, sys
 from collections import defaultdict
+from dataclasses import dataclass, asdict, field
 
-FAILED_LOGIN_THRESHOLD = 50   # failures from one IP -> brute-force suspicion
+# ----------------------------------------------------------------- thresholds
+FAILED_LOGIN_THRESHOLD = 50   # failed logins from one IP/host -> brute-force
+PORT_SCAN_THRESHOLD = 5       # distinct ports from one IP -> port scan
 ANOMALY_Z_THRESHOLD = 3.5     # modified z-score (median/MAD) cutoff for an outlier
+
+# ----------------------------------------------------------------- INPUT SCHEMA VOCAB
+# These are the exact string values the generator emits. If the generator team
+# uses different names, change them HERE — the detection logic doesn't change.
+ST_AUTH = "AUTH"
+ST_FIREWALL = "FIREWALL"
+ST_WEB = "WEB"
+ET_LOGIN_FAILED = "LOGIN_FAILED"
+ET_LOGIN_SUCCESS = "LOGIN_SUCCESS"
+ET_CONN_BLOCKED = "CONNECTION_BLOCKED"          # firewall drop (used for port scan)
+FAILURE_EVENT_TYPES = {ET_LOGIN_FAILED, ET_CONN_BLOCKED}
+
+# destination_port -> software family, so we can correlate CVEs without a
+# version field in the logs. Extend as needed.
+PORT_SOFTWARE = {22: "OpenSSH", 80: "nginx", 443: "nginx",
+                 3306: "MySQL", 5432: "PostgreSQL"}
 
 # Anchor defaults to <project_root>/data so the script works from any directory.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_LOGS = os.path.join(PROJECT_ROOT, "data", "logs.json")
 DEFAULT_CVE = os.path.join(PROJECT_ROOT, "data", "cve_cache.json")
 
+
+# ----------------------------------------------------------------- OUTPUT CONTRACT
+@dataclass
+class SecurityIncident:
+    attack_type: str
+    target_host: str
+    target_port: int
+    source_ips: list
+    confidence: float
+    evidence: dict = field(default_factory=dict)
+
+
 def load(path):
     return json.load(open(path))
 
-# ---------------------------------------------------------------- robust stats
+
+# ----------------------------------------------------------------- robust stats
 def _median(xs):
     s = sorted(xs)
     n = len(s)
@@ -49,143 +84,180 @@ def _robust_z(vals):
     z = {k: (0.0 if scale == 0 else (v - med) / scale) for k, v in vals.items()}
     return z, med
 
-# ---------------------------------------------------------------- detection
+def _is_http_error(code):
+    return isinstance(code, int) and code >= 400
+
+
+# ----------------------------------------------------------------- detection (signatures)
 def detect_brute_force(logs):
+    """Many failed logins from one IP against one host (optionally followed by
+    a success = a confirmed breach)."""
     fails = defaultdict(list)
+    successes = set()
     for l in logs:
-        if l.get("service") == "sshd" and l.get("event") == "auth" and l.get("status") == "failed":
-            fails[(l["source_ip"], l["host"])].append(l)
+        if l.get("source_type") == ST_AUTH and l.get("event_type") == ET_LOGIN_FAILED:
+            fails[(l.get("source_ip"), l.get("host"))].append(l)
+        elif l.get("source_type") == ST_AUTH and l.get("event_type") == ET_LOGIN_SUCCESS:
+            successes.add((l.get("source_ip"), l.get("host")))
     findings = []
     for (ip, host), entries in fails.items():
         if len(entries) >= FAILED_LOGIN_THRESHOLD:
-            # did a success follow from same IP/host?
-            success = any(
-                l["source_ip"] == ip and l["host"] == host
-                and l["service"] == "sshd" and l["status"] == "success"
-                for l in logs
-            )
+            breached = (ip, host) in successes
+            port = entries[0].get("destination_port") or 0
             findings.append({
-                "type": "Brute Force" + (" (SUCCESSFUL)" if success else ""),
-                "ip": ip, "host": host, "count": len(entries),
-                "version": entries[0].get("version", "-"),
-                "breached": success,
+                "attack_type": "Brute Force" + (" (successful)" if breached else ""),
+                "target_host": host, "target_port": port, "source_ips": [ip],
+                "count": len(entries), "breached": breached,
+                "confidence": 0.97 if breached else 0.85,
+                "reason": (f'{len(entries)} failed logins from {ip} on {host}'
+                           + (' followed by a successful login' if breached else '')),
             })
     return findings
 
-def detect_port_scan(logs):
-    probes = defaultdict(set)
+def detect_port_scan(logs, min_ports=PORT_SCAN_THRESHOLD):
+    """One IP touching many distinct destination ports = reconnaissance."""
+    ports_by_ip = defaultdict(set)
+    hosts_by_ip = defaultdict(lambda: defaultdict(int))
     for l in logs:
-        if str(l.get("event", "")).startswith("port_probe"):
-            probes[l["source_ip"]].add(l["event"])
-    return [{"type": "Port Scan", "ip": ip, "host": "firewall",
-             "count": len(ports), "version": "-", "breached": False}
-            for ip, ports in probes.items() if len(ports) >= 5]
+        if l.get("source_type") == ST_FIREWALL or l.get("event_type") == ET_CONN_BLOCKED:
+            dp = l.get("destination_port")
+            if dp is not None:
+                ip = l.get("source_ip")
+                ports_by_ip[ip].add(dp)
+                hosts_by_ip[ip][l.get("host", "-")] += 1
+    findings = []
+    for ip, ports in ports_by_ip.items():
+        if len(ports) >= min_ports:
+            host = max(hosts_by_ip[ip], key=hosts_by_ip[ip].get)
+            findings.append({
+                "attack_type": "Port Scan",
+                "target_host": host, "target_port": 0, "source_ips": [ip],
+                "count": len(ports), "breached": False, "confidence": 0.8,
+                "reason": f'{ip} probed {len(ports)} distinct ports: {sorted(ports)}',
+            })
+    return findings
 
+
+# ----------------------------------------------------------------- detection (generalizer)
 def detect_statistical_anomalies(logs, z_threshold=ANOMALY_Z_THRESHOLD):
     """Signature-FREE detection: the generalizer.
 
-    The rules above look for KNOWN attack shapes. This instead profiles how
-    every source IP behaves, builds a baseline of what "normal" looks like
-    across the whole population, and flags any IP that deviates sharply from
-    it. Because it models normal rather than specific attacks, it catches
-    novel behaviour we never wrote an explicit rule for. No training, no
-    labels, fully explainable (every alert states WHICH metric was abnormal
-    and by how much).
+    Instead of looking for KNOWN attack shapes, profile how every source IP
+    behaves, build a population baseline of 'normal', and flag any IP that
+    deviates sharply. Catches novel attacks we never wrote a rule for (e.g.
+    password spraying that stays under the per-host brute-force threshold).
+    No training, no labels, fully explainable.
     """
-    # 1. Behavioural profile per source IP.
-    prof = defaultdict(lambda: {"events": 0, "failures": 0,
-                                "event_types": set(), "hosts": defaultdict(int),
-                                "versions": defaultdict(int)})
+    prof = defaultdict(lambda: {"events": 0, "failures": 0, "ports": set(),
+                                "hosts": defaultdict(int), "port_counts": defaultdict(int)})
     for l in logs:
         p = prof[l.get("source_ip", "-")]
         p["events"] += 1
-        if l.get("status") in ("failed", "blocked"):
+        if l.get("event_type") in FAILURE_EVENT_TYPES or _is_http_error(l.get("status_code")):
             p["failures"] += 1
-        p["event_types"].add(l.get("event", ""))
+        dp = l.get("destination_port")
+        if dp is not None:
+            p["ports"].add(dp)
+            p["port_counts"][dp] += 1
         p["hosts"][l.get("host", "-")] += 1
-        v = l.get("version", "-")
-        if v and v != "-":
-            p["versions"][v] += 1
 
     ips = list(prof)
     if len(ips) < 3:               # too few entities for a meaningful baseline
         return []
 
-    # 2. Three intuitive, independently-explainable features per IP.
+    # Three intuitive, independently-explainable behavioural features per IP.
     feats = {
-        "failures":        {ip: prof[ip]["failures"]         for ip in ips},
-        "events":          {ip: prof[ip]["events"]           for ip in ips},
-        "distinct_events": {ip: len(prof[ip]["event_types"]) for ip in ips},
+        "failures":       {ip: prof[ip]["failures"]   for ip in ips},
+        "events":         {ip: prof[ip]["events"]     for ip in ips},
+        "distinct_ports": {ip: len(prof[ip]["ports"]) for ip in ips},
     }
     labels = {"failures": "failed/blocked events",
               "events": "total event volume",
-              "distinct_events": "distinct action types"}
+              "distinct_ports": "distinct ports touched"}
 
-    # 3. Robust baseline per feature: median + MAD modified z-scores.
     scores = {f: _robust_z(vals) for f, vals in feats.items()}   # f -> ({ip:z}, median)
 
-    # 4. Flag any IP whose worst feature sits > z_threshold above normal.
     findings = []
     for ip in ips:
         z, feat = max(((scores[f][0][ip], f) for f in feats), key=lambda zf: zf[0])
         if z < z_threshold:
             continue
         median = scores[feat][1]
-        top_host = max(prof[ip]["hosts"], key=prof[ip]["hosts"].get)
-        versions = prof[ip]["versions"]
+        host = max(prof[ip]["hosts"], key=prof[ip]["hosts"].get)
+        pc = prof[ip]["port_counts"]
+        port = max(pc, key=pc.get) if pc else 0
         findings.append({
-            "type": "Behavioral Anomaly", "ip": ip, "host": top_host,
-            "count": feats[feat][ip],
-            "version": max(versions, key=versions.get) if versions else "-",
-            "breached": z >= 2 * z_threshold,
+            "attack_type": "Behavioral Anomaly",
+            "target_host": host, "target_port": port, "source_ips": [ip],
+            "count": feats[feat][ip], "breached": z >= 2 * z_threshold,
             "severity": "HIGH" if z >= 2 * z_threshold else "MEDIUM",
+            "confidence": round(min(0.99, z / (z + z_threshold)), 2),
             "reason": (f'{labels[feat]} = {feats[feat][ip]} vs network median '
                        f'{median:.1f} ({z:.1f}σ above normal, robust median/MAD)'),
         })
     return findings
 
-# ---------------------------------------------------------------- CVE correlation
-def correlate(finding, cves):
-    v = finding.get("version", "-")
-    return [c for c in cves if v in c.get("affected_versions", [])]
 
-# ---------------------------------------------------------------- alerts
+# ----------------------------------------------------------------- CVE correlation
 def _sev_rank(s):
     return {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(s, 3)
 
-def build_alert(finding, matched):
-    base_sev = finding.get("severity") or ("HIGH" if finding["breached"] else "MEDIUM")
+def correlate(target_port, cves):
+    """Map the targeted port -> software family -> known CVEs for that service.
+    Returns (software_name_or_None, [matching cve dicts])."""
+    software = PORT_SOFTWARE.get(target_port)
+    if not software:
+        return None, []
+    matches = [c for c in cves if c.get("software", "").lower() == software.lower()]
+    return software, matches
+
+
+# ----------------------------------------------------------------- incident assembly
+def build_incident(finding, cves):
+    port = finding.get("target_port") or 0
+    software, matched = correlate(port, cves)
+    severity = finding.get("severity") or ("HIGH" if finding.get("breached") else "MEDIUM")
+
+    evidence = {
+        "method": finding.get("method", "signature"),
+        "event_count": finding.get("count"),
+        "reason": finding.get("reason") or finding["attack_type"],
+    }
+    if software:
+        evidence["affected_software"] = software
     if matched:
         top = max(matched, key=lambda c: c["cvss"])
         # a CVE match can RAISE severity but never lowers a detector's own rating
-        sev = base_sev if _sev_rank(base_sev) <= _sev_rank(top["severity"]) else top["severity"]
-        cve_line = (f' \u2014 matches {top["id"]} (CVSS {top["cvss"]}). '
-                    f'{top["recommended_action"]}')
-    else:
-        sev = base_sev
-        cve_line = " \u2014 no matching CVE in cache."
-    body = finding.get("reason") or (
-        f'{finding["count"]} events; affected software {finding["version"]}')
-    return {
-        "severity": sev,
-        "method": finding.get("method", "signature"),
-        "title": f'{finding["type"]} on {finding["host"]} from {finding["ip"]}',
-        "detail": f'{body}{cve_line}',
-        "cves": [c["id"] for c in matched],
-    }
+        if _sev_rank(top["severity"]) < _sev_rank(severity):
+            severity = top["severity"]
+        evidence["matched_cves"] = [c["id"] for c in matched]
+        evidence["top_cve"] = top["id"]
+        evidence["cvss"] = top["cvss"]
+        evidence["recommended_action"] = top["recommended_action"]
+    evidence["severity"] = severity
+
+    return SecurityIncident(
+        attack_type=finding["attack_type"],
+        target_host=finding.get("target_host", "-"),
+        target_port=port,
+        source_ips=finding.get("source_ips", []),
+        confidence=finding.get("confidence", 0.8),
+        evidence=evidence,
+    )
 
 def evaluate(logs, cves):
     findings = []
     for f in detect_brute_force(logs) + detect_port_scan(logs):
-        f["method"] = "signature"        # known attack shapes -> precise label
+        f.setdefault("method", "signature")   # known attack shapes -> precise label
         findings.append(f)
     for f in detect_statistical_anomalies(logs):
-        f["method"] = "behavioral"       # the generalizer -> catches the unknown
+        f.setdefault("method", "behavioral")  # the generalizer -> catches the unknown
         findings.append(f)
-    alerts = [build_alert(f, correlate(f, cves)) for f in findings]
+    incidents = [build_incident(f, cves) for f in findings]
     order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-    alerts.sort(key=lambda a: order.get(a["severity"], 3))
-    return alerts
+    incidents.sort(key=lambda i: (order.get(i.evidence.get("severity"), 3), -i.confidence))
+    return incidents
+
 
 if __name__ == "__main__":
     # Windows consoles default to cp1252, which can't encode chars like 'σ' or
@@ -197,9 +269,22 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--logs", default=DEFAULT_LOGS)
     ap.add_argument("--cve", default=DEFAULT_CVE)
+    ap.add_argument("--json", action="store_true", help="emit incidents as JSON")
     a = ap.parse_args()
-    alerts = evaluate(load(a.logs), load(a.cve))
-    print(f"\n=== {len(alerts)} ALERT(S) ===\n")
-    for al in alerts:
-        print(f'[{al["severity"]}] ({al["method"]}) {al["title"]}')
-        print(f'   {al["detail"]}\n')
+
+    incidents = evaluate(load(a.logs), load(a.cve))
+
+    if a.json:
+        print(json.dumps([asdict(i) for i in incidents], indent=2))
+    else:
+        print(f"\n=== {len(incidents)} INCIDENT(S) ===\n")
+        for inc in incidents:
+            ev = inc.evidence
+            port = f':{inc.target_port}' if inc.target_port else ''
+            print(f'[{ev["severity"]}] ({ev["method"]}) {inc.attack_type} on '
+                  f'{inc.target_host}{port} from {", ".join(inc.source_ips)} '
+                  f'(confidence {inc.confidence})')
+            print(f'   {ev["reason"]}')
+            if ev.get("top_cve"):
+                print(f'   → {ev["top_cve"]} (CVSS {ev["cvss"]}) — {ev["recommended_action"]}')
+            print()
