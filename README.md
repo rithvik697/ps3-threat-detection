@@ -1,81 +1,148 @@
-# PS3 — Log Generation & CVE-Aware Threat Detection
+# CVE-Aware Security Log Threat Detection
 
-Two applications: **App 1** generates realistic security logs with configurable
-attacks; **App 2** ingests them, detects anomalies, and correlates findings with
-known CVEs to produce prioritized, explainable alerts.
+A two-part security pipeline built for a hackathon problem statement. **App 1** generates realistic
+security logs with configurable attack patterns injected. **App 2** ingests those logs, detects
+anomalies, correlates findings against known CVEs, and emits prioritised, explainable incidents.
 
-## Quick start
+Python, stdlib-only detection core, Streamlit UI.
+
+---
+
+## Result
+
+On a 50,000-line generated log set, the initial per-event detection produced **3,415 alerts** —
+unusable for an analyst. After reworking detection around campaign aggregation and behavioural
+profiling, the same input produces **3 accurate incidents**.
+
+What changed:
+
+- **Campaign aggregation** — one incident per attacker/campaign instead of one per event.
+  3,367 SQL-injection events collapse into a single `CRITICAL` incident attributed to the real
+  attacker; distributed port scans and failed-login surges each aggregate into one finding.
+- **Behavioural layer** — only profile IPs with at least `ANOMALY_MIN_EVENTS` events. This removes
+  the one-off-IP flood while still catching concentrated attacks (a credential spray was detected
+  at 40.7σ).
+
+---
+
+## Architecture
+
+```
+        ┌──────────────────────┐
+        │  APP 1: GENERATOR    │
+        │  normal + attack     │
+        │  patterns, config'd  │
+        └──────────┬───────────┘
+                   │  logs.json / .csv / .syslog
+                   │  { timestamp, source_ip, host,
+                   │    service, version, event, status }
+                   ▼
+        ┌──────────────────────┐      ┌──────────────────┐
+        │  APP 2: EVALUATOR    │◄─────│  NVD 2.0 API     │
+        │  1. detect_all       │      │  (live)          │
+        │  2. correlate        │      │  + cached snap   │
+        │  3. prioritise       │      └──────────────────┘
+        └──────────┬───────────┘
+                   │  prioritised incidents
+                   ▼
+        ┌──────────────────────┐
+        │  severity + CVE +    │
+        │  recommended action  │
+        └──────────────────────┘
+```
+
+The evaluator runs as explicit ordered phases — `detect_all` → `correlate_findings` → `prioritise`
+— so detection is fully decoupled from CVE correlation.
+
+---
+
+## CVE correlation
+
+- `--live` pulls current CVEs from the **NVD 2.0 API** at runtime, reading `totalResults` and
+  fetching the newest page, then ranking by recency and severity so the top match is current
+  rather than a stale max-CVSS artifact.
+- Falls back automatically to a cached snapshot on any failure.
+- `--refresh-cve` rebuilds the local cache from a live NVD pull.
+- `cve_source` is recorded in the evidence and shown in output, so every correlation is traceable
+  to where it came from.
+- Correlation is per-attack-type rather than blanket: credential attacks map to SSH/22,
+  SQL injection to database and web services, and port scans — being reconnaissance — get no
+  forced CVE, with the scanned ports carried in the evidence instead.
+
+Uses `urllib` from the standard library; no HTTP dependencies.
+
+---
+
+## Detection
+
+| Rule | Trigger |
+|---|---|
+| Brute force | ≥50 failed SSH logins from one IP against one host; escalated to `HIGH` if a success from the same IP follows |
+| Port scan | one IP probing ≥5 distinct ports |
+| SQL injection | labelled injection events, aggregated per attacker campaign |
+| Behavioural anomaly | statistical profiling of IPs above an event threshold |
+
+Severity ordering includes `CRITICAL`; the CVE cache is enriched for Tomcat, MySQL and PostgreSQL
+alongside the base OpenSSH entries.
+
+---
+
+## Log schema
+
+Both applications agree on this contract:
+
+```json
+{
+  "timestamp": "...",
+  "source_ip": "...",
+  "host": "...",
+  "service": "...",
+  "version": "...",
+  "event": "...",
+  "status": "..."
+}
+```
+
+---
+
+## Running it
+
 ```bash
-pip install flask flask-cors          # only needed for the web UI (optional)
+# optional — only for the web UI
+pip install streamlit
 
-# 1. Generate logs (with attacks injected)
+# 1. generate logs with attacks injected
 cd app1_generator
 python generator.py --lines 50000 --attacks brute_force,port_scan --out ../data/logs.json
 
-# 2. Evaluate them
+# 2. evaluate, correlating against the cached CVE snapshot
 cd ../app2_evaluator
 python evaluator.py --logs ../data/logs.json --cve ../data/cve_cache.json
+
+# or correlate against live NVD data
+python evaluator.py --logs ../data/logs.json --live
 ```
 
-## Architecture & data flow
+---
+
+## Layout
+
 ```
-                 ┌─────────────────────┐
-                 │   APP 1: GENERATOR  │
-                 │  normal + attack    │
-                 │  patterns, configurable
-                 └──────────┬──────────┘
-                            │  logs.json / .csv / .syslog
-                            │  { timestamp, source_ip, host,
-                            │    service, version, event, status }
-                            ▼
-                 ┌─────────────────────┐      ┌──────────────────┐
-                 │   APP 2: EVALUATOR  │◄─────│  cve_cache.json  │
-                 │  1. parse logs      │      │  (NVD/MITRE snap)│
-                 │  2. detect anomalies│      └──────────────────┘
-                 │  3. correlate CVEs  │
-                 │  4. prioritize      │
-                 └──────────┬──────────┘
-                            │  prioritized alerts
-                            ▼
-                 ┌─────────────────────┐
-                 │  ALERT OUTPUT / UI  │
-                 │  severity + CVE +   │
-                 │  recommended action │
-                 └─────────────────────┘
+├── app1_generator/     # log generation: templates, multi-source events, attack injection
+├── app2_evaluator/     # config / models / stats | detectors | correlation | incidents | CLI
+├── data/               # generated logs + CVE cache
+└── run.sh
 ```
 
-## Shared data contract (both apps agree on this)
-```json
-{ "timestamp": "...", "source_ip": "...", "host": "...",
-  "service": "...", "version": "...", "event": "...", "status": "..." }
-```
+The evaluator is split into focused modules — shared `config`/`models`/`stats`, then `detectors`,
+`correlation`, `incidents`, and an `evaluator` CLI that re-exports for backwards compatibility.
 
-## Detection rules (App 2)
-- **Brute force:** ≥50 failed SSH logins from one IP on one host; flagged
-  SUCCESSFUL (HIGH) if a success from the same IP follows.
-- **Port scan:** one IP probing ≥5 distinct ports.
-- **CVE correlation:** match the affected software version against the cached
-  CVE list; attach the highest-CVSS match + recommended action.
+---
 
-## Demo trick
-App 1 deliberately emits logs using `OpenSSH_7.2p2`, a version present in
-`cve_cache.json`. This guarantees a clean, reliable CVE correlation on stage —
-no dependency on a live API during the demo. (To show "live" CVE fetching,
-swap `cve_cache.json` for a real NVD API call — kept cached here for reliability.)
+## My contribution
 
-## Team split (5)
+I built the **App 2 evaluator side**: the detection engine, the campaign-aggregation and
+behavioural layers described above, the NVD live-correlation path with cache fallback, and the
+modular refactor of the evaluator pipeline.
 
-**Generator team (2) — own `generator.py` + Generator tab**
-- **G1:** log templates, multi-source events (auth/web/firewall/app), fake IPs, timestamps, CSV/JSON export.
-- **G2:** attack patterns (brute force, port scan, SQL injection, suspicious admin login) + volume/time/severity controls.
-
-**Evaluator team (3) — own `evaluator.py` + Evaluator tab**
-- **E1 (lead / integration):** detection rules (brute force, port scan, SQL injection, impossible login, privilege escalation); keeps `main` runnable and wires the pipeline together.
-- **E2:** CVE correlation — expand `cve_cache.json`, version matching, optional live NVD lookup toggle.
-- **E3:** alert building (severity, explanation, recommended action) + Evaluator dashboard (alerts table, severity chart).
-
-## Workflow
-- **Stack:** Python + Streamlit (two tabs) over plain logic modules. `pip install streamlit requests`.
-- **Contracts (lock before coding):** (1) log schema below; (2) the software version string in generated logs must exactly match a version in `cve_cache.json`.
-- **Git:** each person on their own branch → merge to `main`; lead keeps `main` always-runnable.
-- **Build order:** push repo → all clone & run baseline → lock contracts → build in parallel → integrate into Streamlit tabs → freeze, polish, rehearse → submit.
+Built during the Aiden AI hackathon, June 2026.
